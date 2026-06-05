@@ -5,6 +5,7 @@ import os
 import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
 from rag_engine import RAGEngine
@@ -85,6 +86,23 @@ async def send_whatsapp_message(to: str, text: str):
         resp = await client.post(url, json=payload, headers=headers)
         logger.info(f"Sent to {to}: {resp.status_code}")
         return resp.json()
+
+
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+
+class AskRequest(BaseModel):
+    question: str
+    history: list[HistoryMessage] = []
+
+
+@app.post("/ask")
+async def ask(body: AskRequest):
+    """Query the RAG engine directly — used by whatsapp-web.js bot."""
+    history = [{"role": m.role, "content": m.content} for m in body.history]
+    answer = rag.query(body.question, history=history)
+    return {"answer": answer}
 
 
 @app.get("/health")

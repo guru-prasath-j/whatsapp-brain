@@ -81,13 +81,17 @@ class RAGEngine:
         self.db = FAISS.from_documents(chunks, self._embeddings())
         self.db.save_local(VECTOR_STORE_PATH)
 
-    def _ollama_chat(self, context: str, question: str) -> str:
+    def _ollama_chat(self, context: str, question: str, history: list = []) -> str:
+        # Build messages: system + prior history (excluding current turn) + current question with context
+        prior = [m for m in history if not (m["role"] == "user" and m["content"] == question)]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *prior[-(9):],  # up to 9 prior turns
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+        ]
         payload = {
             "model": OLLAMA_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
-            ],
+            "messages": messages,
             "stream": False,
             "options": {"temperature": 0.2},
         }
@@ -102,7 +106,7 @@ class RAGEngine:
             logger.error(f"Ollama error: {e}")
             return "Sorry, I ran into an issue. Please try again."
 
-    def query(self, question: str) -> str:
+    def query(self, question: str, history: list = []) -> str:
         if self.db is None:
             return (
                 "Hi! I'm your AI assistant. No documents loaded yet. "
@@ -111,7 +115,7 @@ class RAGEngine:
         try:
             docs = self.db.similarity_search(question, k=4)
             context = "\n\n".join(d.page_content for d in docs)
-            return self._ollama_chat(context, question)
+            return self._ollama_chat(context, question, history=history)
         except Exception as e:
             logger.error(f"RAG error: {e}")
             return "Sorry, I ran into an issue. Please try again."
