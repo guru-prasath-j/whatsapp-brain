@@ -93,6 +93,19 @@ async def summarize(body: SummarizeRequest):
 
 
 # ── /reload — re-index docs without restart ───────────────────────────────────
+@app.post("/switch-model")
+async def switch_model(request: Request):
+    """Hot-swap the Ollama model without restarting."""
+    body = await request.json()
+    model = body.get("model", "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="Missing model")
+    import rag_engine as re_module
+    re_module.OLLAMA_MODEL = model
+    rag._corrections = rag._load_corrections()  # reload in case corrections reference old model
+    logger.info(f"Switched model to: {model}")
+    return {"ok": True, "model": model}
+
 @app.post("/reload")
 async def reload_docs():
     import threading
