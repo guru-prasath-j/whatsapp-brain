@@ -13,6 +13,8 @@ import re
 import glob
 import json
 import logging
+import hashlib
+import threading
 import httpx
 from typing import Optional
 
@@ -34,11 +36,15 @@ OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 INTENT_TYPES = {"greeting", "pricing", "complaint", "followup", "closing", "general"}
 
 SYSTEM_PROMPT = (
-    "You are a helpful WhatsApp assistant for a business. "
-    "Answer using ONLY the business context provided. "
+    "You are a WhatsApp assistant for a business. "
+    "STRICT RULES — follow these no matter what the user asks:\n"
+    "1. Reply in 2-3 SHORT sentences only. Never more. No exceptions.\n"
+    "2. No bullet points, no numbered lists, no markdown, no long explanations.\n"
+    "3. If the user asks to 'explain in detail' or 'elaborate', still reply in 2-3 sentences "
+    "and say they can ask follow-up questions for more.\n"
+    "4. Answer using ONLY the business context provided. "
     "If the answer is not in the context say: "
-    "'I don't have that information right now. Please contact us directly.' "
-    "Keep replies short and conversational (max 3 sentences). No markdown."
+    "'I don't have that information right now. Please contact us directly.'"
 )
 
 
@@ -47,6 +53,10 @@ class RAGEngine:
     def __init__(self):
         self.db: Optional[FAISS] = None
         self._corrections: list  = self._load_corrections()
+        self._summary_cache: dict          = {}
+        self._summary_lock: threading.Lock = threading.Lock()
+        # Only one summary runs at a time — Ollama is single-threaded
+        self._summary_sem: threading.Semaphore = threading.Semaphore(1)
         self._load()
 
     # ── Vector store ─────────────────────────────────────────────────────────
@@ -205,7 +215,7 @@ class RAGEngine:
             f"{text_block}\n\nSummary:"
         )
         try:
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=120.0) as client:
                 r = client.post(f"{OLLAMA_BASE_URL}/api/generate", json={
                     "model": OLLAMA_MODEL,
                     "prompt": prompt,
@@ -216,6 +226,30 @@ class RAGEngine:
         except Exception as e:
             logger.warning(f"Summary failed: {e}")
             return ""
+
+    def _summary_cache_key(self, old_msgs: list) -> str:
+        if not old_msgs:
+            return ""
+        text = "\n".join(f"{m['role']}:{m['content']}" for m in old_msgs)
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+    def _run_summary_background(self, old_msgs: list, cache_key: str) -> None:
+        # Skip immediately if another summary is already running
+        acquired = self._summary_sem.acquire(blocking=False)
+        if not acquired:
+            logger.debug("Summary skipped — another summary already running")
+            return
+        try:
+            # Brief pause so the main Ollama chat call can finish first
+            import time
+            time.sleep(5)
+            summary = self._summarize_old_messages(old_msgs)
+            if summary:
+                with self._summary_lock:
+                    self._summary_cache[cache_key] = summary
+                logger.info(f"Background summary cached (key={cache_key[:8]}…, {len(old_msgs)} msgs)")
+        finally:
+            self._summary_sem.release()
 
     # ── #8 Corrections ───────────────────────────────────────────────────────
     def _load_corrections(self) -> list:
@@ -327,10 +361,12 @@ class RAGEngine:
 
         messages = [{"role": "system", "content": system}]
 
-        # Inject summary if we have old messages
+        # Inject summary if we have old messages (never block — read from cache only)
         summary = customer_profile.get("summary", "") if customer_profile else ""
         if not summary and old_msgs:
-            summary = self._summarize_old_messages(old_msgs)
+            cache_key = self._summary_cache_key(old_msgs)
+            with self._summary_lock:
+                summary = self._summary_cache.get(cache_key, "")
 
         if summary:
             messages.append({
