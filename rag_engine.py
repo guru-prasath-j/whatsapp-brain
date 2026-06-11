@@ -31,6 +31,7 @@ VECTOR_STORE_PATH  = os.getenv("VECTOR_STORE_PATH",  "vector_store")
 CORRECTIONS_FILE   = os.getenv("CORRECTIONS_FILE",   "corrections.json")
 OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
 OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL",       "llama3.2:latest")
+OLLAMA_FAST_MODEL  = os.getenv("OLLAMA_FAST_MODEL",  OLLAMA_MODEL)  # smaller model for suggestions
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 INTENT_TYPES = {"greeting", "pricing", "complaint", "followup", "closing", "general"}
@@ -42,9 +43,23 @@ SYSTEM_PROMPT = (
     "2. No bullet points, no numbered lists, no markdown, no long explanations.\n"
     "3. If the user asks to 'explain in detail' or 'elaborate', still reply in 2-3 sentences "
     "and say they can ask follow-up questions for more.\n"
-    "4. Answer using ONLY the business context provided. "
-    "If the answer is not in the context say: "
+    "4. Answer using ONLY facts explicitly written in the Business Context below. "
+    "NEVER guess, invent, or add any detail that is not clearly stated in the context. "
+    "If the exact answer is not in the context, say exactly: "
     "'I don't have that information right now. Please contact us directly.'"
+)
+
+SUGGESTIONS_SYSTEM_PROMPT = (
+    "You are a WhatsApp business assistant. Write 3 short reply options for the agent to send.\n"
+    "Rules:\n"
+    "1. Use ONLY facts from the Business Context — do not invent anything.\n"
+    "2. Each reply: 1 sentence, plain text, no markdown, no 'A:' prefix.\n"
+    "3. Give 3 different phrasings of the same answer.\n"
+    "4. The Business Context always has the answer — never say 'I don't have that information'.\n"
+    "5. Output exactly like this example (replace the example text with your actual replies):\n"
+    "1. Our platform is completely free to use.\n"
+    "2. No payment required, all features are free.\n"
+    "3. You can use everything on the platform at no cost."
 )
 
 
@@ -147,11 +162,12 @@ class RAGEngine:
         return "English"
 
     # ── #5 Intent Detection ──────────────────────────────────────────────────
-    def _detect_intent(self, question: str) -> str:
+    def _detect_intent(self, question: str, use_llm: bool = True) -> str:
         """
         Classify the message intent so the reply prompt can be tailored.
         Uses fast keyword heuristics first; falls back to a tiny Ollama call
-        only for ambiguous messages.
+        only for ambiguous messages when use_llm=True.
+        Pass use_llm=False (suggestions path) to skip the LLM call entirely.
         """
         q = question.lower().strip()
 
@@ -176,7 +192,10 @@ class RAGEngine:
                                  "will do", "fine"]):
             return "closing"
 
-        # LLM fallback for ambiguous messages
+        if not use_llm:
+            return "general"
+
+        # LLM fallback for ambiguous messages (auto-reply path only)
         try:
             with httpx.Client(timeout=8.0) as client:
                 r = client.post(f"{OLLAMA_BASE_URL}/api/generate", json={
@@ -338,20 +357,21 @@ class RAGEngine:
             if parts:
                 profile_block = "\n\nCustomer Profile:\n" + "\n".join(parts)
 
-        # Build system prompt
-        suggestion_note = (
-            "\n\nGenerate exactly 3 reply options as a JSON array: [\"reply1\",\"reply2\",\"reply3\"]\n"
-            "Vary tone: 1=concise, 2=warm, 3=detailed. No markdown."
-        ) if for_suggestions else ""
-
-        system = (
-            SYSTEM_PROMPT
-            + (f"\n{tone}" if tone else "")
-            + (f"\n{lang_note}" if lang_note else "")
-            + profile_block
-            + correction_block
-            + suggestion_note
-        )
+        if for_suggestions:
+            system = (
+                SUGGESTIONS_SYSTEM_PROMPT
+                + (f"\n{lang_note}" if lang_note else "")
+                + profile_block
+                + correction_block
+            )
+        else:
+            system = (
+                SYSTEM_PROMPT
+                + (f"\n{tone}" if tone else "")
+                + (f"\n{lang_note}" if lang_note else "")
+                + profile_block
+                + correction_block
+            )
 
         # History with summary (#9)
         # Split: summarise old messages, keep last 10 verbatim
@@ -375,22 +395,25 @@ class RAGEngine:
             })
 
         messages.extend(recent_msgs)
-        messages.append({
-            "role":    "user",
-            "content": f"Business Context:\n{context}\n\nCustomer message: {question}",
-        })
+        user_content = f"Business Context:\n{context}\n\nCustomer message: {question}"
+        if for_suggestions:
+            user_content += '\n\nWrite the 3 reply options now:'
+        messages.append({"role": "user", "content": user_content})
 
         return messages
 
     # ── Ollama call ───────────────────────────────────────────────────────────
     def _ollama(self, messages: list, temperature: float = 0.2,
-                json_format: bool = False) -> str:
+                json_format: bool = False, num_predict: int = None,
+                model: str = None) -> str:
         payload = {
-            "model":    OLLAMA_MODEL,
+            "model":    model or OLLAMA_MODEL,
             "messages": messages,
             "stream":   False,
             "options":  {"temperature": temperature},
         }
+        if num_predict:
+            payload["options"]["num_predict"] = num_predict
         if json_format:
             payload["format"] = "json"
         try:
@@ -418,7 +441,7 @@ class RAGEngine:
             intent   = _cached_intent(self, question)
             language = self._detect_language(question)
 
-            # Skip RAG for pure greetings — reply faster
+            # Skip RAG for pure greetings / closings — reply faster
             if intent == "greeting":
                 lang_note = f"Reply in {language}." if language != "English" else ""
                 msgs = [
@@ -426,8 +449,18 @@ class RAGEngine:
                      "content": SYSTEM_PROMPT + "\nThis is a greeting — be warm, brief, mention 1-2 services. " + lang_note},
                     {"role": "user", "content": question},
                 ]
-                answer = self._ollama(msgs, temperature=0.4)
+                answer = self._ollama(msgs, temperature=0.4, num_predict=120)
                 return answer or "Hello! How can I help you today?"
+
+            if intent == "closing":
+                lang_note = f"Reply in {language}." if language != "English" else ""
+                msgs = [
+                    {"role": "system",
+                     "content": SYSTEM_PROMPT + "\nConversation is wrapping up — give a warm, very brief sign-off and invite future contact. " + lang_note},
+                    {"role": "user", "content": question},
+                ]
+                answer = self._ollama(msgs, temperature=0.4, num_predict=80)
+                return answer or "Thank you! Feel free to reach out anytime."
 
             # RAG retrieval with reranking (#2)
             raw_docs = self.db.similarity_search(question, k=15)
@@ -438,7 +471,7 @@ class RAGEngine:
                 question, context, intent, language,
                 history, customer_profile
             )
-            answer = self._ollama(messages, temperature=0.2)
+            answer = self._ollama(messages, temperature=0.2, num_predict=150)
             return answer or "Sorry, I ran into an issue. Please try again."
 
         except Exception as e:
@@ -459,11 +492,26 @@ class RAGEngine:
                 "Thanks for reaching out. Let me help you.",
             ]
         try:
-            intent   = _cached_intent(self, question)
+            # Skip LLM intent call for suggestions — heuristics only (saves 8s)
+            intent   = self._detect_intent(question, use_llm=False)
             language = self._detect_language(question)
 
-            raw_docs = self.db.similarity_search(question, k=15)
-            docs     = self._rerank_docs(question, raw_docs, top_k=5)
+            # Greeting / closing: skip RAG entirely — return intent-appropriate options instantly
+            if intent == "greeting":
+                return [
+                    "Hello! Welcome to Portfolio Simulator. How can I help you?",
+                    "Hi there! How can I assist you with your investment queries today?",
+                    "Hey! Great to hear from you. What would you like to know?",
+                ]
+            if intent == "closing":
+                return [
+                    "You're welcome! Feel free to reach out anytime.",
+                    "Happy to help! Let us know if you have more questions.",
+                    "Anytime! Have a great day.",
+                ]
+
+            raw_docs = self.db.similarity_search(question, k=20)
+            docs     = self._rerank_docs(question, raw_docs, top_k=6)
             context  = "\n\n".join(d.page_content for d in docs)
 
             messages = self._build_messages(
@@ -471,14 +519,9 @@ class RAGEngine:
                 history, customer_profile, for_suggestions=True
             )
 
-            # Try with JSON format first
-            raw = self._ollama(messages, temperature=0.7, json_format=True)
-            result = _parse_suggestions(raw)
-            if result:
-                return result
-
-            # Fallback without JSON format
-            raw = self._ollama(messages, temperature=0.7)
+            # Use fast model for suggestions (no json_format — small models output JSON Schema objects)
+            raw = self._ollama(messages, temperature=0.4, num_predict=200,
+                               model=OLLAMA_FAST_MODEL)
             result = _parse_suggestions(raw)
             if result:
                 return result
@@ -527,46 +570,80 @@ def _cached_intent(engine, question: str) -> str:
     return _intent_cache[key]
 
 
+def _clean(s: str) -> str:
+    """Strip surrounding quotes, FAQ prefixes, and JSON artifact suffixes."""
+    s = s.strip().strip('"').strip("'")
+    s = re.sub(r'^[AaQq]\s*:\s*', '', s)           # strip "A: " / "Q: " FAQ prefix
+    s = re.sub(r'["\s]*:\s*[\[\]{},]*\s*$', '', s) # strip "":[] suffix
+    return s.strip()
+
+
+def _is_valid_suggestion(s: str) -> bool:
+    """Reject URLs, JSON schema metadata, and non-reply strings."""
+    if not s or len(s) < 8 or len(s) > 300:
+        return False
+    if s.startswith(('http://', 'https://', '$', '#')):
+        return False
+    if s.lower() in ('array', 'string', 'object', 'number', 'boolean', 'null', 'integer',
+                     'true', 'false', 'items', 'properties', 'type'):
+        return False
+    return True
+
+
 def _parse_suggestions(raw: str) -> list:
-    """Parse a JSON array of 3 suggestions from LLM output."""
+    """Parse 3 suggestion strings from LLM output — handles array, dict, or plain lines."""
     if not raw:
         return []
+
+    # Helper: filter and pad a candidate list
+    def _finalize(candidates: list) -> list:
+        valid = [s for s in candidates if _is_valid_suggestion(s)]
+        if len(valid) < 2:
+            return []
+        while len(valid) < 3:
+            valid.append(valid[0])
+        return valid[:3]
+
     try:
-        # Direct JSON parse
         parsed = json.loads(raw)
+        # ["r1","r2","r3"]
         if isinstance(parsed, list) and len(parsed) >= 2:
-            result = [str(s).strip() for s in parsed[:3]]
-            while len(result) < 3:
-                result.append(result[0])
-            return result
+            result = _finalize([_clean(str(s)) for s in parsed[:5] if str(s).strip()])
+            if result:
+                return result
         if isinstance(parsed, dict):
-            vals = [str(v).strip() for v in parsed.values() if v]
-            if len(vals) >= 2:
-                while len(vals) < 3:
-                    vals.append(vals[0])
-                return vals[:3]
+            # {"r1":"r2","r3":...} — values are the replies
+            vals = [_clean(str(v)) for v in parsed.values()
+                    if str(v).strip() and str(v).strip() not in ('[]', '{}', 'null', 'None')]
+            result = _finalize(vals)
+            if result:
+                return result
+            # llama3.2 sometimes puts replies as KEYS with empty values — use keys
+            keys = [_clean(str(k)) for k in parsed.keys() if len(str(k)) > 8]
+            result = _finalize(keys)
+            if result:
+                return result
     except json.JSONDecodeError:
         pass
 
-    # Regex extraction
+    # Regex: extract first JSON array in output
     match = re.search(r'\[[\s\S]*?\]', raw)
     if match:
         try:
             arr = json.loads(match.group())
             if isinstance(arr, list) and len(arr) >= 2:
-                result = [str(s).strip() for s in arr[:3]]
-                while len(result) < 3:
-                    result.append(result[0])
-                return result
+                result = _finalize([_clean(str(s)) for s in arr[:5] if str(s).strip()])
+                if result:
+                    return result
         except Exception:
             pass
 
-    # Line extraction
-    lines = [re.sub(r'^[\d\*\-•]+[\.\):\s]+', '', l).strip() for l in raw.split('\n')]
-    lines = [l for l in lines if 5 < len(l) < 300]
-    if len(lines) >= 2:
-        while len(lines) < 3:
-            lines.append(lines[0])
-        return lines[:3]
-
-    return []
+    # Line extraction — strip numbering AND trailing JSON artifacts
+    lines = []
+    for l in raw.split('\n'):
+        l = re.sub(r'^[\d\*\-•]+[\.\):\s]+', '', l)  # strip "1. " prefix
+        l = re.sub(r'["\s]*:\s*[\[\]{},]*\s*$', '', l)  # strip "":[] suffix
+        l = l.strip().strip('"').strip("'")
+        if _is_valid_suggestion(l):
+            lines.append(l)
+    return _finalize(lines)
