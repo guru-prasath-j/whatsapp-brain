@@ -22,6 +22,7 @@ from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
+from langchain_openai import OpenAIEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ class RAGEngine:
 
     # ── Vector store ─────────────────────────────────────────────────────────
     def _embeddings(self):
+        if OPENAI_API_KEY:
+            return OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=OPENAI_API_KEY)
         return OllamaEmbeddings(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
     def _load(self):
@@ -439,11 +442,14 @@ class RAGEngine:
             logger.error(f"ChatGPT error: {e}")
             return ""
 
-    # ── LLM router: ChatGPT if key set, else Ollama ───────────────────────────
+    # ── LLM router: ChatGPT → Ollama fallback ────────────────────────────────
     def _llm(self, messages: list, temperature: float = 0.2,
              num_predict: int = None, model: str = None) -> str:
         if OPENAI_API_KEY:
-            return self._chatgpt(messages, temperature, max_tokens=num_predict or 150)
+            result = self._chatgpt(messages, temperature, max_tokens=num_predict or 150)
+            if result:
+                return result
+            logger.warning("ChatGPT failed — falling back to Ollama")
         return self._ollama(messages, temperature, num_predict=num_predict, model=model)
 
     # ── Public: single answer ─────────────────────────────────────────────────
