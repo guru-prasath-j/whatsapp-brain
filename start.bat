@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableDelayedExpansion
 title WhatsApp Brain — RAG Server
 color 0A
 
@@ -59,10 +60,17 @@ curl -s http://localhost:11434/ >nul 2>&1
 if errorlevel 1 (
     echo  [INFO] Ollama is not running. Starting it...
     start /B ollama serve
-    timeout /t 4 /nobreak >nul
-    curl -s http://localhost:11434/ >nul 2>&1
-    if errorlevel 1 (
-        echo  [WARNING] Could not start Ollama automatically.
+    echo  [WAIT] Waiting for Ollama to be ready...
+    set OLLAMA_READY=0
+    for /L %%i in (1,1,20) do (
+        if "!OLLAMA_READY!"=="0" (
+            timeout /t 2 /nobreak >nul
+            curl -s http://localhost:11434/ >nul 2>&1
+            if not errorlevel 1 set OLLAMA_READY=1
+        )
+    )
+    if "!OLLAMA_READY!"=="0" (
+        echo  [WARNING] Could not connect to Ollama after 40 seconds.
         echo  Please start Ollama manually and re-run this script.
         echo  Download from: https://ollama.com
         pause

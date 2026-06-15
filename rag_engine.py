@@ -31,8 +31,10 @@ VECTOR_STORE_PATH  = os.getenv("VECTOR_STORE_PATH",  "vector_store")
 CORRECTIONS_FILE   = os.getenv("CORRECTIONS_FILE",   "corrections.json")
 OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
 OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL",       "llama3.2:latest")
-OLLAMA_FAST_MODEL  = os.getenv("OLLAMA_FAST_MODEL",  OLLAMA_MODEL)  # smaller model for suggestions
+OLLAMA_FAST_MODEL  = os.getenv("OLLAMA_FAST_MODEL",  OLLAMA_MODEL)
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "")
+OPENAI_MODEL       = os.getenv("OPENAI_MODEL",       "gpt-4o-mini")
 
 INTENT_TYPES = {"greeting", "pricing", "complaint", "followup", "closing", "general"}
 
@@ -90,7 +92,11 @@ class RAGEngine:
                 return
             except Exception as e:
                 logger.warning(f"Could not load store: {e}. Rebuilding…")
-        self._build_from_docs()
+        try:
+            self._build_from_docs()
+        except Exception as e:
+            logger.warning(f"[Startup] Could not build index (Ollama may not be running yet): {e}. "
+                           "Server will start in fallback mode — POST /reload once Ollama is up.")
 
     def _build_from_docs(self):
         docs = []
@@ -197,18 +203,12 @@ class RAGEngine:
 
         # LLM fallback for ambiguous messages (auto-reply path only)
         try:
-            with httpx.Client(timeout=8.0) as client:
-                r = client.post(f"{OLLAMA_BASE_URL}/api/generate", json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": (
-                        "Classify this WhatsApp message into ONE word from: "
-                        "greeting, pricing, complaint, followup, closing, general\n"
-                        f"Message: {question[:200]}\nAnswer:"
-                    ),
-                    "stream": False,
-                    "options": {"temperature": 0, "num_predict": 5},
-                })
-            intent = r.json().get("response", "general").strip().lower()
+            msgs = [{"role": "user", "content": (
+                "Classify this WhatsApp message into ONE word from: "
+                "greeting, pricing, complaint, followup, closing, general\n"
+                f"Message: {question[:200]}\nAnswer:"
+            )}]
+            intent = self._llm(msgs, temperature=0, num_predict=5).strip().lower()
             if intent in INTENT_TYPES:
                 return intent
         except Exception:
@@ -234,14 +234,8 @@ class RAGEngine:
             f"{text_block}\n\nSummary:"
         )
         try:
-            with httpx.Client(timeout=120.0) as client:
-                r = client.post(f"{OLLAMA_BASE_URL}/api/generate", json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.2, "num_predict": 120},
-                })
-            return r.json().get("response", "").strip()
+            msgs = [{"role": "user", "content": prompt}]
+            return self._llm(msgs, temperature=0.2, num_predict=120)
         except Exception as e:
             logger.warning(f"Summary failed: {e}")
             return ""
@@ -427,6 +421,31 @@ class RAGEngine:
             logger.error(f"Ollama error: {e}")
             return ""
 
+    # ── ChatGPT call ──────────────────────────────────────────────────────────
+    def _chatgpt(self, messages: list, temperature: float = 0.2,
+                 max_tokens: int = 150) -> str:
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                r = client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json={"model": OPENAI_MODEL, "messages": messages,
+                          "temperature": temperature, "max_tokens": max_tokens},
+                )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"ChatGPT error: {e}")
+            return ""
+
+    # ── LLM router: ChatGPT if key set, else Ollama ───────────────────────────
+    def _llm(self, messages: list, temperature: float = 0.2,
+             num_predict: int = None, model: str = None) -> str:
+        if OPENAI_API_KEY:
+            return self._chatgpt(messages, temperature, max_tokens=num_predict or 150)
+        return self._ollama(messages, temperature, num_predict=num_predict, model=model)
+
     # ── Public: single answer ─────────────────────────────────────────────────
     def query(self, question: str, history: list = [],
               customer_profile: dict = {}) -> str:
@@ -449,7 +468,7 @@ class RAGEngine:
                      "content": SYSTEM_PROMPT + "\nThis is a greeting — be warm, brief, mention 1-2 services. " + lang_note},
                     {"role": "user", "content": question},
                 ]
-                answer = self._ollama(msgs, temperature=0.4, num_predict=120)
+                answer = self._llm(msgs, temperature=0.4, num_predict=120)
                 return answer or "Hello! How can I help you today?"
 
             if intent == "closing":
@@ -459,7 +478,7 @@ class RAGEngine:
                      "content": SYSTEM_PROMPT + "\nConversation is wrapping up — give a warm, very brief sign-off and invite future contact. " + lang_note},
                     {"role": "user", "content": question},
                 ]
-                answer = self._ollama(msgs, temperature=0.4, num_predict=80)
+                answer = self._llm(msgs, temperature=0.4, num_predict=80)
                 return answer or "Thank you! Feel free to reach out anytime."
 
             # RAG retrieval with reranking (#2)
@@ -471,7 +490,7 @@ class RAGEngine:
                 question, context, intent, language,
                 history, customer_profile
             )
-            answer = self._ollama(messages, temperature=0.2, num_predict=150)
+            answer = self._llm(messages, temperature=0.2, num_predict=150)
             return answer or "Sorry, I ran into an issue. Please try again."
 
         except Exception as e:
@@ -520,8 +539,8 @@ class RAGEngine:
             )
 
             # Use fast model for suggestions (no json_format — small models output JSON Schema objects)
-            raw = self._ollama(messages, temperature=0.4, num_predict=200,
-                               model=OLLAMA_FAST_MODEL)
+            raw = self._llm(messages, temperature=0.4, num_predict=200,
+                            model=OLLAMA_FAST_MODEL)
             result = _parse_suggestions(raw)
             if result:
                 return result
