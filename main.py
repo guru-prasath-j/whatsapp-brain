@@ -23,7 +23,7 @@ from fastapi.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import httpx
-from rag_engine import RAGEngine, DOCS_DIR
+from rag_engine import RAGEngine, DOCS_DIR, OPENAI_API_KEY, OPENAI_MODEL, OLLAMA_MODEL
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -405,10 +405,15 @@ loadDocs();
 # ── /health ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
+    if OPENAI_API_KEY:
+        provider = f"openai/{OPENAI_MODEL}"
+    else:
+        provider = f"ollama/{OLLAMA_MODEL}"
     return {
-        "status":      "ok",
-        "docs_loaded": rag.doc_count(),
-        "corrections": len(rag._corrections),
+        "status":       "ok",
+        "llm_provider": provider,
+        "docs_loaded":  rag.doc_count(),
+        "corrections":  len(rag._corrections),
     }
 
 

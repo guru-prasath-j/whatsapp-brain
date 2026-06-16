@@ -73,8 +73,8 @@ class RAGEngine:
         self._corrections: list  = self._load_corrections()
         self._summary_cache: dict          = {}
         self._summary_lock: threading.Lock = threading.Lock()
-        # Only one summary runs at a time — Ollama is single-threaded
         self._summary_sem: threading.Semaphore = threading.Semaphore(1)
+        logger.info(f"LLM provider: {'OpenAI (' + OPENAI_MODEL + ')' if OPENAI_API_KEY else 'Ollama (' + OLLAMA_MODEL + ')'}")
         self._load()
 
     # ── Vector store ─────────────────────────────────────────────────────────
@@ -98,8 +98,8 @@ class RAGEngine:
         try:
             self._build_from_docs()
         except Exception as e:
-            logger.warning(f"[Startup] Could not build index (Ollama may not be running yet): {e}. "
-                           "Server will start in fallback mode — POST /reload once Ollama is up.")
+            logger.warning(f"[Startup] Could not build index: {e}. "
+                           "Server will start in fallback mode — POST /reload to retry.")
 
     def _build_from_docs(self):
         docs = []
